@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
@@ -51,10 +53,24 @@ const (
 type Block [32 * 1024]int32
 
 var (
-	burnMemStart, burnMemStop, burnMemNohup, includeBufferCache, avoidBeingKilled bool
-	memPercent, memReserve, memRate                                               int
-	burnMemMode                                                                   string
+	burnMemStart, burnMemStop, burnMemNohup, includeBufferCache, avoidBeingKilled, rateFlag, isHost bool
+	memPercent, memReserve, memRate                                                                 int
+	burnMemMode                                                                                     string
 )
+
+func init() {
+	//	var logfile *os.File
+	//	var err error
+	//	logfile, err = os.OpenFile("./chaos_burnmem.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	//	if err != nil {
+	//		fmt.Println("OPen log failed err:", err)
+	//		return
+	//	}
+	//	log.SetOutput(logfile)
+	//	log.SetPrefix("[ chaos-server ]")
+	//	log.SetFlags(log.Lshortfile | log.Lmicroseconds | log.Ldate)
+	isHost = !isCout()
+}
 
 func main() {
 	flag.BoolVar(&burnMemStart, "start", false, "start burn memory")
@@ -64,10 +80,15 @@ func main() {
 	flag.BoolVar(&avoidBeingKilled, "avoid-being-killed", false, "prevent mem-burn process from being killed by oom-killer")
 	flag.IntVar(&memPercent, "mem-percent", 0, "percent of burn memory")
 	flag.IntVar(&memReserve, "reserve", 0, "reserve to burn memory, unit is M")
-	flag.IntVar(&memRate, "rate", 100, "burn memory rate, unit is M/S, only support for ram mode")
+	flag.IntVar(&memRate, "rate", 0, "burn memory rate, unit is M/S, only support for ram mode")
 	flag.StringVar(&burnMemMode, "mode", "cache", "burn memory mode, cache or ram")
 	bin.ParseFlagAndInitLog()
 
+	if memRate <= 0 {
+		rateFlag = false
+	} else {
+		rateFlag = true
+	}
 	if burnMemStart {
 		startBurnMem()
 	} else if burnMemStop {
@@ -97,11 +118,18 @@ func burnMemWithRam() {
 	var cache = make(map[int][]Block, 1)
 	var count = 1
 	cache[count] = make([]Block, 0)
-	if memRate <= 0 {
-		memRate = 100
-	}
+	state := sync.Mutex{}
 	for range tick {
+		state.Lock()
 		_, expectMem, err := calculateMemSize(memPercent, memReserve)
+		if !rateFlag {
+
+			if expectMem > 2048 {
+				memRate = 1024
+			} else {
+				memRate = 100
+			}
+		}
 		if err != nil {
 			stopBurnMemFunc()
 			bin.PrintErrAndExit(err.Error())
@@ -124,9 +152,11 @@ func burnMemWithRam() {
 				cache[count] = make([]Block, 0)
 				buf = cache[count]
 			}
-			logrus.Debugf("count: %d, len(buf): %d, cap(buf): %d, expect mem: %d, fill size: %d",
-				count, len(buf), cap(buf), expectMem, fillSize)
+			//log.Printf("count: %d, len(buf): %d, cap(buf): %d, expect mem: %d, fill size: %d",
+			//	count, len(buf), cap(buf), expectMem, fillSize)
+			//log.Printf("%s",fillSize)
 			cache[count] = append(buf, make([]Block, fillSize)...)
+			state.Unlock()
 		}
 	}
 }
@@ -278,7 +308,7 @@ func calculateMemSize(percent, reserve int) (int64, int64, error) {
 		}
 	} else {
 		total = int64(memoryStat.Usage.Limit)
-		available = total - int64(memoryStat.Usage.Usage)
+		available = total - int64(memoryStat.ActiveAnon+memoryStat.InactiveAnon)
 		if burnMemMode == "ram" && !includeBufferCache {
 			available = available + int64(memoryStat.Cache)
 		}
@@ -289,10 +319,27 @@ func calculateMemSize(percent, reserve int) (int64, int64, error) {
 	} else {
 		reserved = int64(reserve)
 	}
-	expectSize := available/1024/1024 - reserved
 
-	logrus.Debugf("available: %d, percent: %d, reserved: %d, expectSize: %d",
-		available/1024/1024, percent, reserved, expectSize)
+	if !isHost {
+		activeAnon := int64(memoryStat.ActiveAnon)
+		inactiveAnon := int64(memoryStat.InactiveAnon)
+		used := int64(activeAnon + inactiveAnon)
+		expectSize := (total*int64(percent)/100 - used) / 1024 / 1024
+		//log.Printf("isCout")
+		//log.Printf("total: %d, used: %d, percent: %d, expectSize: %d",
+		//	total/1024/1024, used/1024/1024, percent, expectSize)
+		//
+		//log.Printf("available: %d, percent: %d, reserved: %d, expectSize: %d",
+		//	available/1024/1024, percent, reserved, expectSize)
+
+		return total / 1024 / 1024, expectSize, nil
+	}
+
+	expectSize := available/1024/1024 - reserved
+	//log.Printf("total: %d, percent: %d, expectSize: %d",
+	//	total/1024/1024, percent, expectSize)
+	//log.Printf("available: %d, percent: %d, reserved: %d, expectSize: %d",
+	//	available/1024/1024, percent, reserved, expectSize)
 
 	return total / 1024 / 1024, expectSize, nil
 }
@@ -307,4 +354,20 @@ func getMemoryStatsByCGroup() (*v1.MemoryStat, error) {
 		return nil, fmt.Errorf("load cgroup stat error, %v", err)
 	}
 	return stats.Memory, nil
+}
+
+func isCout() bool {
+	cgroupfile, err := os.Open("/proc/1/cgroup")
+	if err != nil {
+		fmt.Println(err)
+	}
+	defer cgroupfile.Close()
+
+	rd := bufio.NewReader(cgroupfile)
+	if err != nil {
+		fmt.Println(err)
+	}
+	cgroup, _, err := rd.ReadLine()
+
+	return strings.Contains(string(cgroup), "kubepods")
 }
