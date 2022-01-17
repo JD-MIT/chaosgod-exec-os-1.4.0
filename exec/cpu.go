@@ -87,6 +87,11 @@ blade create cpu load --cpu-percent 60`,
 					Desc:     "durations(s) to climb",
 					Required: false,
 				},
+				&spec.ExpFlag{
+					Name:     "absolute",
+					Desc:     "burnCpu absolutely (turn on by using --absolute=true)",
+					Required: false,
+				},
 			},
 		},
 	}

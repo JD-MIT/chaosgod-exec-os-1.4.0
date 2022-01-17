@@ -20,17 +20,17 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
+	"os"
 	"path"
 	"strings"
 	"time"
 
+	"github.com/chaosblade-io/chaosblade-exec-os/exec"
+	"github.com/chaosblade-io/chaosblade-exec-os/exec/bin"
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/sirupsen/logrus"
-
-	"github.com/chaosblade-io/chaosblade-exec-os/exec"
-	"github.com/chaosblade-io/chaosblade-exec-os/exec/bin"
 )
 
 const count = 100
@@ -174,17 +174,24 @@ func getArgs() (string, string, string) {
 	createArgs := "if=/dev/zero of=%s bs=%dM count=%d oflag=dsync"
 	runningReadArgs := "if=%s of=/dev/null bs=%sM count=%d iflag=dsync,direct,fullblock"
 	runningWriteArgs := "if=/dev/zero of=%s bs=%sM count=%d oflag=dsync"
+
 	ctx := context.Background()
-	response := cl.Run(ctx, "cat", "/etc/os-release")
-	if !response.Success {
-		logrus.Warnf("cat /etc/os-release failed, %v. use the default value.", response.Err)
-		return createArgs, runningReadArgs, runningWriteArgs
+	if _, err := os.Stat("/etc/os-release"); err != nil {
+		log.Println("文件不存在!")
+	} else {
+		response := cl.Run(ctx, "cat", "/etc/os-release")
+		if !response.Success {
+			bin.PrintErrAndExit(response.Err)
+			return "", "", ""
+		}
+
+		if strings.Contains(strings.ToUpper(response.Result.(string)), "ID=ALPINE") {
+			//alpine linux
+			createArgs = "if=/dev/zero of=%s bs=%dM count=%d oflag=append"
+			runningReadArgs = "if=%s of=/dev/null bs=%sM count=%d iflag=fullblock oflag=append"
+			runningWriteArgs = "if=/dev/zero of=%s bs=%sM count=%d oflag=append"
+		}
 	}
-	if response.Result != nil && strings.Contains(strings.ToUpper(response.Result.(string)), "ID=ALPINE") {
-		//alpine linux
-		createArgs = "if=/dev/zero of=%s bs=%dM count=%d oflag=append"
-		runningReadArgs = "if=%s of=/dev/null bs=%sM count=%d iflag=fullblock oflag=append"
-		runningWriteArgs = "if=/dev/zero of=%s bs=%sM count=%d oflag=append"
-	}
+
 	return createArgs, runningReadArgs, runningWriteArgs
 }
